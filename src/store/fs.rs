@@ -64,7 +64,7 @@
 //! safely shut down as well. Any store refs you are holding will be inoperable
 //! after this.
 use std::{
-    fmt::{self, Debug},
+    fmt::Debug,
     fs,
     future::Future,
     io::Write,
@@ -121,7 +121,7 @@ use crate::{
             util::entity_manager::{self, ActiveEntityState},
         },
         gc::run_gc,
-        util::{BaoTreeSender, FixedSize, MemOrFile, ValueOrPoisioned},
+        util::{BaoTreeSender, FixedSize, MemOrFile},
         IROH_BLOCK_SIZE,
     },
     util::{
@@ -242,18 +242,20 @@ struct Actor {
     context: Arc<TaskContext>,
     // Receiver for incoming user commands.
     cmd_rx: tokio::sync::mpsc::Receiver<Command>,
+    // GC commands must not keep the public command channel alive.
+    gc_cmd_rx: tokio::sync::mpsc::Receiver<Command>,
     // Receiver for incoming file store specific commands.
     fs_cmd_rx: tokio::sync::mpsc::Receiver<InternalCommand>,
     // Tasks for import and export operations.
     tasks: JoinSet<()>,
+    // Entity actors persist their state after their command senders are dropped.
+    entity_tasks: JoinSet<()>,
     // Entity manager that handles concurrency for entities.
     handles: EntityManagerState<EmParams>,
     // temp tags
     temp_tags: TempTags,
     // waiters for idle state.
     idle_waiters: Vec<irpc::channel::oneshot::Sender<()>>,
-    // our private tokio runtime. It has to live somewhere.
-    _rt: RtWrapper,
 }
 
 type HashContext = ActiveEntityState<EmParams>;
@@ -442,6 +444,7 @@ impl Actor {
     fn log_task_result(res: Result<(), JoinError>) {
         match res {
             Ok(_) => {}
+            Err(e) if e.is_cancelled() => {}
             Err(e) => {
                 error!("task failed: {e}");
             }
@@ -457,7 +460,7 @@ impl Actor {
         tx.send(tt).await.ok();
     }
 
-    async fn handle_command(&mut self, cmd: Command) {
+    async fn handle_command(&mut self, cmd: Command) -> Option<proto::ShutdownMsg> {
         let span = cmd.parent_span();
         let _entered = span.enter();
         match cmd {
@@ -467,7 +470,7 @@ impl Actor {
             }
             Command::WaitIdle(cmd) => {
                 trace!("{cmd:?}");
-                if self.tasks.is_empty() {
+                if self.tasks.is_empty() && self.entity_tasks.is_empty() {
                     // we are currently idle
                     cmd.tx.send(()).await.ok();
                 } else {
@@ -477,7 +480,7 @@ impl Actor {
             }
             Command::Shutdown(cmd) => {
                 trace!("{cmd:?}");
-                self.db().send(cmd.into()).await.ok();
+                return Some(cmd);
             }
             Command::CreateTag(cmd) => {
                 trace!("{cmd:?}");
@@ -545,25 +548,26 @@ impl Actor {
             }
             Command::ExportPath(cmd) => {
                 trace!("{cmd:?}");
-                cmd.spawn(&mut self.handles, &mut self.tasks).await;
+                cmd.spawn(&mut self.handles, &mut self.entity_tasks).await;
             }
             Command::ExportBao(cmd) => {
                 trace!("{cmd:?}");
-                cmd.spawn(&mut self.handles, &mut self.tasks).await;
+                cmd.spawn(&mut self.handles, &mut self.entity_tasks).await;
             }
             Command::ExportRanges(cmd) => {
                 trace!("{cmd:?}");
-                cmd.spawn(&mut self.handles, &mut self.tasks).await;
+                cmd.spawn(&mut self.handles, &mut self.entity_tasks).await;
             }
             Command::ImportBao(cmd) => {
                 trace!("{cmd:?}");
-                cmd.spawn(&mut self.handles, &mut self.tasks).await;
+                cmd.spawn(&mut self.handles, &mut self.entity_tasks).await;
             }
             Command::Observe(cmd) => {
                 trace!("{cmd:?}");
-                cmd.spawn(&mut self.handles, &mut self.tasks).await;
+                cmd.spawn(&mut self.handles, &mut self.entity_tasks).await;
             }
         }
+        None
     }
 
     async fn handle_fs_command(&mut self, cmd: InternalCommand) {
@@ -593,49 +597,77 @@ impl Actor {
                             format: cmd.format,
                         },
                     );
-                    (tt, cmd).spawn(&mut self.handles, &mut self.tasks).await;
+                    (tt, cmd)
+                        .spawn(&mut self.handles, &mut self.entity_tasks)
+                        .await;
                 }
             }
         }
     }
 
-    async fn run(mut self) {
-        loop {
+    async fn run(mut self) -> Option<irpc::channel::oneshot::Sender<()>> {
+        let shutdown = loop {
             tokio::select! {
                 task = self.handles.tick() => {
                     if let Some(task) = task {
-                        self.spawn(task);
+                        self.entity_tasks.spawn(task.instrument(tracing::Span::current()));
                     }
                 }
                 cmd = self.cmd_rx.recv() => {
                     let Some(cmd) = cmd else {
-                        break;
+                        break None;
                     };
-                    self.handle_command(cmd).await;
+                    if let Some(shutdown) = self.handle_command(cmd).await {
+                        break Some(shutdown);
+                    }
+                }
+                Some(cmd) = self.gc_cmd_rx.recv() => {
+                    if let Some(shutdown) = self.handle_command(cmd).await {
+                        break Some(shutdown);
+                    }
                 }
                 Some(cmd) = self.fs_cmd_rx.recv() => {
                     self.handle_fs_command(cmd).await;
                 }
                 Some(res) = self.tasks.join_next(), if !self.tasks.is_empty() => {
                     Self::log_task_result(res);
-                    if self.tasks.is_empty() {
-                        for tx in self.idle_waiters.drain(..) {
-                            tx.send(()).await.ok();
-                        }
-                    }
+                }
+                Some(res) = self.entity_tasks.join_next(), if !self.entity_tasks.is_empty() => {
+                    Self::log_task_result(res);
                 }
             }
-        }
-        self.handles.shutdown().await;
+            if self.tasks.is_empty() && self.entity_tasks.is_empty() {
+                for tx in self.idle_waiters.drain(..) {
+                    tx.send(()).await.ok();
+                }
+            }
+        };
+        drop(self.cmd_rx);
+        self.tasks.abort_all();
+        drop(self.fs_cmd_rx);
+        drop(self.gc_cmd_rx);
+        // Closing entity command channels cancels response streams and persists partial state.
+        drop(self.handles);
         while let Some(res) = self.tasks.join_next().await {
             Self::log_task_result(res);
         }
+        while let Some(res) = self.entity_tasks.join_next().await {
+            Self::log_task_result(res);
+        }
+        let mut shutdown = shutdown?;
+        let (tx, rx) = irpc::channel::oneshot::channel();
+        let response = std::mem::replace(&mut shutdown.tx, tx);
+        // Persist entity state before stopping the database, and retain the public ACK.
+        self.context.db.send(shutdown.into()).await.ok()?;
+        rx.await.ok()?;
+        Some(response)
     }
 
     async fn new(
         db_path: PathBuf,
-        rt: RtWrapper,
+        rt: tokio::runtime::Handle,
         cmd_rx: tokio::sync::mpsc::Receiver<Command>,
+        gc_cmd_rx: tokio::sync::mpsc::Receiver<Command>,
         fs_commands_rx: tokio::sync::mpsc::Receiver<InternalCommand>,
         fs_commands_tx: tokio::sync::mpsc::Sender<InternalCommand>,
         options: Arc<Options>,
@@ -668,12 +700,13 @@ impl Actor {
         Ok(Self {
             context: slot_context.clone(),
             cmd_rx,
+            gc_cmd_rx,
             fs_cmd_rx: fs_commands_rx,
             tasks: JoinSet::new(),
+            entity_tasks: JoinSet::new(),
             handles: EntityManagerState::new(slot_context, 1024, 32, 32, 2),
             temp_tags: Default::default(),
             idle_waiters: Vec::new(),
-            _rt: rt,
         })
     }
 }
@@ -807,40 +840,6 @@ impl HashSpecificCommand for (TempTag, ImportEntryMsg) {
 
 fn err_entity_dead() -> io::Error {
     io::Error::other("entity is dead")
-}
-
-struct RtWrapper(Option<tokio::runtime::Runtime>);
-
-impl From<tokio::runtime::Runtime> for RtWrapper {
-    fn from(rt: tokio::runtime::Runtime) -> Self {
-        Self(Some(rt))
-    }
-}
-
-impl fmt::Debug for RtWrapper {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        ValueOrPoisioned(self.0.as_ref()).fmt(f)
-    }
-}
-
-impl Deref for RtWrapper {
-    type Target = tokio::runtime::Runtime;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref().unwrap()
-    }
-}
-
-impl Drop for RtWrapper {
-    fn drop(&mut self) {
-        if let Some(rt) = self.0.take() {
-            trace!("dropping tokio runtime");
-            tokio::task::block_in_place(|| {
-                drop(rt);
-            });
-            trace!("dropped tokio runtime");
-        }
-    }
 }
 
 async fn handle_batch(cmd: BatchMsg, id: Scope, scope: Arc<TempTagScope>, ctx: Arc<TaskContext>) {
@@ -1394,39 +1393,102 @@ impl FsStore {
         Self::load_with_opts(db_path, options).await
     }
 
-    /// Load or create a new store with custom options, returning an additional sender for file store specific commands.
+    /// Load or create a new store with custom options.
     pub async fn load_with_opts(db_path: PathBuf, options: Options) -> Result<FsStore> {
-        static THREAD_NR: AtomicU64 = AtomicU64::new(0);
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .thread_name_fn(|| {
-                format!(
-                    "iroh-blob-store-{}",
-                    THREAD_NR.fetch_add(1, Ordering::Relaxed)
-                )
-            })
-            .enable_time()
-            .build()?;
-        let handle = rt.handle().clone();
-        let (commands_tx, commands_rx) = tokio::sync::mpsc::channel(100);
-        let (fs_commands_tx, fs_commands_rx) = tokio::sync::mpsc::channel(100);
-        let gc_config = options.gc.clone();
-        let actor = handle
-            .spawn(Actor::new(
-                db_path,
-                rt.into(),
-                commands_rx,
-                fs_commands_rx,
-                fs_commands_tx.clone(),
-                Arc::new(options),
-            ))
-            .await
-            .anyerr()??;
-        handle.spawn(actor.run());
-        let store = FsStore::new(commands_tx.into(), fs_commands_tx);
-        if let Some(config) = gc_config {
-            handle.spawn(run_gc(store.deref().clone(), config));
-        }
+        let (store, ready, _owner) = Self::start_with_opts(db_path, options)?;
+        ready.await.anyerr()??;
         Ok(store)
+    }
+
+    fn start_with_opts(
+        db_path: PathBuf,
+        options: Options,
+    ) -> Result<(
+        Self,
+        tokio::sync::oneshot::Receiver<Result<()>>,
+        std::thread::JoinHandle<()>,
+    )> {
+        static THREAD_NR: AtomicU64 = AtomicU64::new(0);
+        let (commands_tx, commands_rx) = tokio::sync::mpsc::channel(100);
+        let (gc_commands_tx, gc_commands_rx) = tokio::sync::mpsc::channel(100);
+        let (fs_commands_tx, fs_commands_rx) = tokio::sync::mpsc::channel(100);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (retired_tx, retired_rx) = tokio::sync::watch::channel(());
+        let internal_tx = fs_commands_tx.clone();
+        let owner = std::thread::Builder::new()
+            .name("iroh-blob-store-owner".into())
+            .spawn(move || {
+                let mut ready = Some(ready_tx);
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_> {
+                        // The runtime must be dropped outside its own workers, including on init errors.
+                        let rt = tokio::runtime::Builder::new_multi_thread()
+                            .thread_name_fn(|| {
+                                format!(
+                                    "iroh-blob-store-{}",
+                                    THREAD_NR.fetch_add(1, Ordering::Relaxed)
+                                )
+                            })
+                            .enable_time()
+                            .build()?;
+                        let handle = rt.handle().clone();
+                        rt.block_on(async {
+                            let gc_config = options.gc.clone();
+                            let actor = Actor::new(
+                                db_path,
+                                handle.clone(),
+                                commands_rx,
+                                gc_commands_rx,
+                                fs_commands_rx,
+                                internal_tx,
+                                Arc::new(options),
+                            )
+                            .await?;
+                            if ready.take().unwrap().send(Ok(())).is_err() {
+                                return Ok(None);
+                            }
+                            if let Some(config) = gc_config {
+                                let gc_store = Store::from_sender(
+                                    irpc::LocalSender::from(gc_commands_tx).into(),
+                                );
+                                handle.spawn(run_gc(gc_store, config));
+                            }
+                            Ok(actor.run().await)
+                        })
+                    }));
+                let result = match result {
+                    Ok(result) => result,
+                    Err(panic) => {
+                        let message = panic
+                            .downcast_ref::<&str>()
+                            .copied()
+                            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                            .unwrap_or("unknown panic");
+                        Err(n0_error::anyerr!("file store actor panicked: {message}"))
+                    }
+                };
+                // This witnesses runtime destruction, before the owner thread's response tail.
+                drop(retired_tx);
+                match result {
+                    Ok(Some(response)) => {
+                        n0_future::future::block_on(response.send(())).ok();
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if let Some(ready) = ready {
+                            // Failed startup is observable only after the runtime has fully stopped.
+                            ready.send(Err(error)).ok();
+                        } else {
+                            error!("file store actor stopped: {error:#}");
+                        }
+                    }
+                }
+            })?;
+        Ok((
+            FsStore::new(commands_tx.into(), fs_commands_tx, retired_rx),
+            ready_rx,
+            owner,
+        ))
     }
 }
 
@@ -1443,6 +1505,7 @@ impl FsStore {
 pub struct FsStore {
     sender: ApiClient,
     db: tokio::sync::mpsc::Sender<InternalCommand>,
+    retired: tokio::sync::watch::Receiver<()>,
 }
 
 impl From<FsStore> for Store {
@@ -1469,11 +1532,30 @@ impl FsStore {
     fn new(
         sender: irpc::LocalSender<proto::Request>,
         db: tokio::sync::mpsc::Sender<InternalCommand>,
+        retired: tokio::sync::watch::Receiver<()>,
     ) -> Self {
         Self {
             sender: sender.into(),
             db,
+            retired,
         }
+    }
+
+    /// Wait until the private runtime and all its blocking work have stopped.
+    ///
+    /// The returned future does not keep the store alive and can outlive every store clone.
+    /// Completion also follows actor failure; it does not imply a clean shutdown or join
+    /// the owner thread's final response delivery.
+    pub fn wait_retired(&self) -> impl Future<Output = ()> + Send + 'static {
+        let mut retired = self.retired.clone();
+        async move { while retired.changed().await.is_ok() {} }
+    }
+
+    /// Shut down the store and wait for private runtime destruction, even on RPC failure.
+    pub async fn shutdown(&self) -> irpc::Result<()> {
+        let result = self.deref().shutdown().await;
+        self.wait_retired().await;
+        result
     }
 
     pub async fn dump(&self) -> Result<()> {
@@ -2310,3 +2392,6 @@ pub mod tests {
         })
     }
 }
+
+#[cfg(test)]
+mod startup_tests;

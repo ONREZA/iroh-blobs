@@ -163,7 +163,6 @@ impl<T: RangeSetEntry + Clone> RangeSetExt<T> for RangeSetRef<T> {
 #[cfg(feature = "fs-store")]
 mod fs {
     use std::{
-        fmt,
         fs::{File, OpenOptions},
         io::{self, Read, Write},
         path::Path,
@@ -365,17 +364,6 @@ mod fs {
         }
 
         result
-    }
-
-    pub struct ValueOrPoisioned<T>(pub Option<T>);
-
-    impl<T: fmt::Debug> fmt::Debug for ValueOrPoisioned<T> {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            match &self.0 {
-                Some(x) => x.fmt(f),
-                None => f.debug_tuple("Poisoned").finish(),
-            }
-        }
     }
 }
 #[cfg(feature = "fs-store")]
