@@ -292,7 +292,7 @@ async fn hash_sync_waits_for_actual_metadata_prefix_after_file_sync() -> TestRes
     let mut options = Options::new(dir.path());
     options.inline = InlineOptions::NO_INLINE;
     options.batch.max_write_batch = 2;
-    options.batch.max_read_duration = Duration::from_secs(60);
+    options.batch.max_write_duration = Duration::from_secs(60);
     let store = timeout(DEADLINE, FsStore::load_with_opts(db_path, options.clone())).await??;
     let data = test_data(32769);
     let hash = Hash::new(&data);

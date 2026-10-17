@@ -54,7 +54,7 @@ async fn import_and_tag_receipts_precede_commit_but_db_sync_waits() -> TestResul
     let mut options = Options::new(dir.path());
     // Import Update and CreateTag end this batch without waiting for a timer.
     options.batch.max_write_batch = 2;
-    options.batch.max_read_duration = Duration::from_secs(60);
+    options.batch.max_write_duration = Duration::from_secs(60);
     let store = timeout(DEADLINE, FsStore::load_with_opts(db_path.clone(), options)).await??;
     let data = b"unique inline payload proving the API receipt precedes the actual metadata commit";
     let import_store = store.clone();
@@ -150,5 +150,120 @@ async fn partial_receipt_and_db_sync_leave_bitfield_until_observer_retires() -> 
         complete_data
     );
     timeout(DEADLINE, store.shutdown()).await??;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn write_batch_uses_write_duration_independently_of_read_duration() -> TestResult<()> {
+    use super::{
+        delete_set,
+        entry_state::{DataLocation, EntryState, OutboardLocation},
+        meta,
+    };
+    use crate::{
+        api::proto::{SyncDbMsg, SyncDbRequest},
+        util::channel::oneshot as local_oneshot,
+        Hash,
+    };
+
+    for (read_ms, write_ms) in [(100, 10), (10, 100)] {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("blobs.db");
+        let (entered, mut entered_rx) = oneshot::channel();
+        let (sync_db_queued, queued_rx) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        COMMIT_GATES.lock().unwrap().insert(
+            db_path.clone(),
+            CommitGate {
+                entered,
+                sync_db_queued,
+                release: released,
+            },
+        );
+        let mut options = Options::new(dir.path());
+        options.batch.max_read_duration = Duration::from_millis(read_ms);
+        options.batch.max_write_duration = Duration::from_millis(write_ms);
+        let (_, deletes) = delete_set::pair(std::sync::Arc::new(options.path));
+        let (commands, inbox) = tokio::sync::mpsc::channel(4);
+        let actor = meta::Actor::new(db_path, inbox, deletes, options.batch)?;
+        let data = bytes::Bytes::from_static(b"write duration commit witness");
+        let hash = Hash::new(&data);
+        let state = EntryState::Complete {
+            data_location: DataLocation::Inline(data),
+            outboard_location: OutboardLocation::NotNeeded,
+        };
+        let (set_tx, set_rx) = local_oneshot::channel();
+        commands.try_send(
+            meta::Set {
+                hash,
+                state,
+                tx: set_tx,
+                span: tracing::Span::none(),
+            }
+            .into(),
+        )?;
+        let mut actor = Box::pin(actor.run());
+        assert!(poll_fn(|cx| Poll::Ready(actor.as_mut().poll(cx)))
+            .await
+            .is_pending());
+        set_rx.await??;
+        assert!(matches!(
+            entered_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        tokio::time::advance(Duration::from_millis(write_ms - 1)).await;
+        assert!(poll_fn(|cx| Poll::Ready(actor.as_mut().poll(cx)))
+            .await
+            .is_pending());
+        assert!(
+            matches!(
+                entered_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "WRITE_BATCH_COMMITTED_BEFORE_WRITE_DEADLINE: read={read_ms} write={write_ms}"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(poll_fn(|cx| Poll::Ready(actor.as_mut().poll(cx)))
+            .await
+            .is_pending());
+        assert!(
+            entered_rx.try_recv().is_ok(),
+            "WRITE_BATCH_MISSED_WRITE_DEADLINE: read={read_ms} write={write_ms}"
+        );
+
+        // No top-level message can end this batch until its own deadline was witnessed.
+        let (sync_tx, sync_rx) = irpc::channel::oneshot::channel();
+        commands.try_send(
+            SyncDbMsg {
+                inner: SyncDbRequest,
+                tx: sync_tx,
+                rx: irpc::channel::none::NoReceiver,
+                span: tracing::Span::none(),
+            }
+            .into(),
+        )?;
+        let (get_tx, get_rx) = local_oneshot::channel();
+        commands.try_send(
+            meta::Get {
+                hash,
+                tx: get_tx,
+                span: tracing::Span::none(),
+            }
+            .into(),
+        )?;
+        drop(commands);
+        release.send(()).unwrap();
+        assert!(poll_fn(|cx| Poll::Ready(actor.as_mut().poll(cx)))
+            .await
+            .is_ready());
+        queued_rx.await?;
+        sync_rx.await??;
+        let stored = get_rx.await?.state?.unwrap();
+        assert!(
+            matches!(stored, EntryState::Complete { data_location: DataLocation::Inline(data), .. }
+            if data.as_ref() == b"write duration commit witness")
+        );
+    }
     Ok(())
 }

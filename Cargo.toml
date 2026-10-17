@@ -56,6 +56,7 @@ chrono = {version = "0.4.39", default-features = false, features = ["js-sys", "w
 getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
+tokio = { version = "1.43.0", features = ["test-util"] }
 clap = { version = "4.5.31", features = ["derive"] }
 hex = "0.4.3"
 iroh-test = "0.31.0"
