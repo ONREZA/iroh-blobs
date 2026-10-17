@@ -42,7 +42,7 @@ async fn opening_error_retires_owner() -> TestResult<()> {
     let root = dir.path().join("root-file");
     fs::write(&root, b"not a directory")?;
     let (store, ready, owner) =
-        FsStore::start_with_opts(root.join("blobs.db"), Options::new(&root))?;
+        FsStore::start_with_opts(root.join("blobs.db"), Options::new(&root), ())?;
     assert!(timeout(DEADLINE, ready).await??.is_err());
     drop(store);
     join_owner(owner).await
@@ -53,7 +53,7 @@ async fn duplicate_database_open_returns_error_without_stopping_first_store() ->
     let dir = tempfile::tempdir()?;
     let root = dir.path();
     let (store, ready, owner) =
-        FsStore::start_with_opts(root.join("blobs.db"), Options::new(root))?;
+        FsStore::start_with_opts(root.join("blobs.db"), Options::new(root), ())?;
     timeout(DEADLINE, ready).await???;
     assert!(timeout(DEADLINE, FsStore::load(root)).await?.is_err());
     let tag = store
@@ -81,7 +81,8 @@ async fn converted_store_outlives_fs_store_and_retires_with_gc() -> TestResult<(
                     add_protected: None,
                 });
             }
-            let (store, ready, owner) = FsStore::start_with_opts(root.join("blobs.db"), options)?;
+            let (store, ready, owner) =
+                FsStore::start_with_opts(root.join("blobs.db"), options, ())?;
             timeout(DEADLINE, ready).await???;
             let converted: Store = store.clone().into();
             drop(store);
@@ -121,7 +122,8 @@ async fn cancelled_startup_retires_before_and_after_readiness_with_gc() -> TestR
                     add_protected: None,
                 });
             }
-            let (store, ready, owner) = FsStore::start_with_opts(root.join("blobs.db"), options)?;
+            let (store, ready, owner) =
+                FsStore::start_with_opts(root.join("blobs.db"), options, ())?;
             match ready_state {
                 0 => drop(ready),
                 1 => {
@@ -162,7 +164,7 @@ async fn dropping_store_cancels_pending_gc_callback_and_retires_owner() -> TestR
             }
         })),
     });
-    let (store, ready, owner) = FsStore::start_with_opts(root.join("blobs.db"), options)?;
+    let (store, ready, owner) = FsStore::start_with_opts(root.join("blobs.db"), options, ())?;
     timeout(DEADLINE, ready).await???;
     timeout(DEADLINE, entered.notified()).await?;
     drop(store);
@@ -179,14 +181,14 @@ impl Drop for NotifyOnDrop {
     }
 }
 
-struct BlockingGc {
+pub(super) struct BlockingGc {
     release: NotifyOnDrop,
-    entered: Arc<tokio::sync::Notify>,
-    exited: tokio::sync::oneshot::Receiver<()>,
+    pub(super) entered: Arc<tokio::sync::Notify>,
+    pub(super) exited: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl BlockingGc {
-    fn new(root: &Path) -> (Options, Self) {
+    pub(super) fn new(root: &Path) -> (Options, Self) {
         thread_local! {
             static THREAD_EXIT: std::cell::RefCell<Option<NotifyOnDrop>> = const {
                 std::cell::RefCell::new(None)
@@ -234,7 +236,7 @@ impl BlockingGc {
         )
     }
 
-    fn release(&mut self) {
+    pub(super) fn release(&mut self) {
         drop(self.release.0.take());
     }
 
@@ -382,7 +384,7 @@ async fn startup_panic_returns_error_and_retires_owner() -> TestResult<()> {
     let dir = tempfile::tempdir()?;
     // A root path has no parent, exercising the existing startup panic boundary.
     let (store, ready, owner) =
-        FsStore::start_with_opts(PathBuf::from("/"), Options::new(dir.path()))?;
+        FsStore::start_with_opts(PathBuf::from("/"), Options::new(dir.path()), ())?;
     let error = timeout(DEADLINE, ready).await??.unwrap_err();
     assert!(error.to_string().contains("file store actor panicked"));
     assert!(timeout(DEADLINE, store.shutdown()).await?.is_err());
@@ -400,7 +402,7 @@ async fn retained_response_handles_do_not_keep_owner_alive() -> TestResult<()> {
         let dir = tempfile::tempdir()?;
         let root = dir.path();
         let (store, ready, owner) =
-            FsStore::start_with_opts(root.join("blobs.db"), Options::new(root))?;
+            FsStore::start_with_opts(root.join("blobs.db"), Options::new(root), ())?;
         timeout(DEADLINE, ready).await???;
         let mut observed = store.observe(Hash::new(b"observed")).stream().await?;
         assert!(timeout(DEADLINE, observed.next()).await?.is_some());
@@ -428,7 +430,7 @@ async fn wait_idle_waits_for_entity_response_streams() -> TestResult<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path();
     let (store, ready, owner) =
-        FsStore::start_with_opts(root.join("blobs.db"), Options::new(root))?;
+        FsStore::start_with_opts(root.join("blobs.db"), Options::new(root), ())?;
     timeout(DEADLINE, ready).await???;
     let mut observed = store.observe(Hash::new(b"observed")).stream().await?;
     assert!(timeout(DEADLINE, observed.next()).await?.is_some());

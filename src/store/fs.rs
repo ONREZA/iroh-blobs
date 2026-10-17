@@ -1449,14 +1449,31 @@ impl FsStore {
 
     /// Load or create a new store with custom options.
     pub async fn load_with_opts(db_path: PathBuf, options: Options) -> Result<FsStore> {
-        let (store, ready, _owner) = Self::start_with_opts(db_path, options)?;
+        Self::load_with_opts_and_custody(db_path, options, ()).await
+    }
+
+    /// Load or create a store, retaining owned custody until its private runtime stops.
+    ///
+    /// Custody moves to the existing native owner before startup effects. Cancelling
+    /// this future or dropping its caller's runtime cannot release it while native
+    /// work remains. A never-polled future starts no native work and drops custody.
+    /// Custody is dropped before retirement is signalled, including after startup
+    /// failure. Its destructor must only release ownership and must not block.
+    /// This lifetime guarantee does not prove persistence or a resource budget.
+    pub async fn load_with_opts_and_custody<C: Send + 'static>(
+        db_path: PathBuf,
+        options: Options,
+        custody: C,
+    ) -> Result<FsStore> {
+        let (store, ready, _owner) = Self::start_with_opts(db_path, options, custody)?;
         ready.await.anyerr()??;
         Ok(store)
     }
 
-    fn start_with_opts(
+    fn start_with_opts<C: Send + 'static>(
         db_path: PathBuf,
         options: Options,
+        custody: C,
     ) -> Result<(
         Self,
         tokio::sync::oneshot::Receiver<Result<()>>,
@@ -1487,6 +1504,8 @@ impl FsStore {
                             .build()?;
                         let handle = rt.handle().clone();
                         rt.block_on(async {
+                            #[cfg(test)]
+                            custody_tests::startup_gate(&options.path.data_path).await;
                             let gc_config = options.gc.clone();
                             let actor = Actor::new(
                                 db_path,
@@ -1521,6 +1540,8 @@ impl FsStore {
                         Err(n0_error::anyerr!("file store actor panicked: {message}"))
                     }
                 };
+                // Custody must outlive runtime destruction, including failed startup and unwind.
+                drop(custody);
                 // This witnesses runtime destruction, before the owner thread's response tail.
                 drop(retired_tx);
                 match result {
@@ -2479,3 +2500,6 @@ mod phase_boundary_tests;
 
 #[cfg(test)]
 mod persistence_tests;
+
+#[cfg(test)]
+mod custody_tests;
