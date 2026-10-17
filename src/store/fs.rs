@@ -175,6 +175,14 @@ pub(crate) enum InternalCommand {
     Dump(meta::Dump),
     FinishImport(ImportEntryMsg),
     ClearScope(ClearScope),
+    SyncHash(SyncHash),
+}
+
+#[derive(Debug)]
+pub(crate) struct SyncHash {
+    hash: Hash,
+    tx: oneshot::Sender<io::Result<()>>,
+    span: tracing::Span,
 }
 
 #[derive(Debug)]
@@ -187,6 +195,7 @@ impl InternalCommand {
         match self {
             Self::Dump(_) => tracing::Span::current(),
             Self::ClearScope(_) => tracing::Span::current(),
+            Self::SyncHash(cmd) => cmd.span.clone(),
             Self::FinishImport(cmd) => cmd
                 .parent_span_opt()
                 .cloned()
@@ -321,6 +330,12 @@ impl SyncEntityApi for HashContext {
         trace!("write_batch bitfield={:?} batch={}", bitfield, batch.len());
         let mut res = Ok(None);
         self.state.send_if_modified(|state| {
+            if let BaoFileStorage::Partial(file) = state {
+                if let Err(error) = file.invalidate(&self.options().path.bitfield_path(&self.id)) {
+                    res = Err(error);
+                    return false;
+                }
+            }
             let Ok((state1, update)) = state.take().write_batch(batch, bitfield, self) else {
                 res = Err(io::Error::other("write batch failed"));
                 return false;
@@ -574,6 +589,9 @@ impl Actor {
         let span = cmd.parent_span();
         let _entered = span.enter();
         match cmd {
+            InternalCommand::SyncHash(cmd) => {
+                cmd.spawn(&mut self.handles, &mut self.entity_tasks).await;
+            }
             InternalCommand::Dump(cmd) => {
                 trace!("{cmd:?}");
                 self.db().send(cmd.into()).await.ok();
@@ -748,6 +766,32 @@ trait HashSpecificCommand: HashSpecific + Send + 'static {
         if let Some(task) = task {
             tasks.spawn(task);
         }
+    }
+}
+
+impl HashSpecific for SyncHash {
+    fn hash(&self) -> Hash {
+        self.hash
+    }
+}
+
+impl HashSpecificCommand for SyncHash {
+    async fn handle(self, ctx: HashContext) {
+        ctx.load().await;
+        let result = {
+            let storage = ctx.state.borrow();
+            storage.sync_all(&ctx.options().path.bitfield_path(&ctx.id))
+        };
+        self.tx.send(result);
+    }
+
+    async fn on_error(self, arg: SpawnArg<EmParams>) {
+        let error = match arg {
+            SpawnArg::Busy => io::ErrorKind::ResourceBusy.into(),
+            SpawnArg::Dead => err_entity_dead(),
+            _ => unreachable!(),
+        };
+        self.tx.send(Err(error));
     }
 }
 
@@ -1032,6 +1076,12 @@ async fn finish_import_impl(ctx: &HashContext, import_data: ImportEntry) -> io::
     }
     ctx.load().await;
     let handle = &ctx.state;
+    {
+        let storage = handle.borrow();
+        if let BaoFileStorage::Partial(file) = &*storage {
+            file.invalidate(&options.path.bitfield_path(&hash))?;
+        }
+    }
     // if I do have an existing handle, I have to possibly deal with observers.
     // if I don't have an existing handle, there are 2 cases:
     //   the entry exists in the db, but we don't have a handle
@@ -1105,7 +1155,11 @@ async fn finish_import_impl(ctx: &HashContext, import_data: ImportEntry) -> io::
             MemOrFile::File(file)
         }
     };
-    handle.complete(data, outboard);
+    handle.complete(
+        data,
+        outboard,
+        matches!(&data_location, DataLocation::Owned(_)),
+    );
     let state = EntryState::Complete {
         data_location,
         outboard_location,
@@ -1556,6 +1610,30 @@ impl FsStore {
         let result = self.deref().shutdown().await;
         self.wait_retired().await;
         result
+    }
+
+    /// Synchronize this hash's current file state, then commit prior metadata writes.
+    ///
+    /// Await import and tag results first, and retain their existing retention pins.
+    /// This preserves active readers but does not drain concurrent writers. Reopening
+    /// a partial hash invalidates its sidecar again and needs its own write allowance.
+    /// Dropping this future does not acknowledge persistence or retire its queued work.
+    pub async fn sync_hash(&self, hash: Hash) -> io::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .send(
+                SyncHash {
+                    hash,
+                    tx,
+                    span: tracing::Span::current(),
+                }
+                .into(),
+            )
+            .await
+            .map_err(|_| io::Error::other("file store actor down"))?;
+        rx.await
+            .map_err(|_| io::Error::other("receive hash sync"))??;
+        self.deref().sync_db().await.map_err(io::Error::other)
     }
 
     pub async fn dump(&self) -> Result<()> {
@@ -2395,3 +2473,9 @@ pub mod tests {
 
 #[cfg(test)]
 mod startup_tests;
+
+#[cfg(test)]
+mod phase_boundary_tests;
+
+#[cfg(test)]
+mod persistence_tests;

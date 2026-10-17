@@ -4,6 +4,7 @@ use std::{
     io,
     ops::Deref,
     path::Path,
+    sync::atomic::{AtomicU8, Ordering},
 };
 
 use bao_tree::{
@@ -130,6 +131,13 @@ fn max_offset(batch: &[BaoContentItem]) -> u64 {
         .unwrap_or(0)
 }
 
+#[repr(u8)]
+enum PartialPersistence {
+    Dirty,
+    Clean,
+    InvalidationNeeded,
+}
+
 /// A file storage for an incomplete bao file.
 #[derive(Debug)]
 pub struct PartialFileStorage {
@@ -137,6 +145,7 @@ pub struct PartialFileStorage {
     outboard: std::fs::File,
     sizes: std::fs::File,
     bitfield: Bitfield,
+    persistence: AtomicU8,
 }
 
 impl PartialFileStorage {
@@ -145,6 +154,10 @@ impl PartialFileStorage {
     }
 
     pub(super) fn sync_all(&self, bitfield_path: &Path) -> io::Result<()> {
+        // Entity callbacks serialize syncs; the watch read guard excludes payload writes.
+        if self.persistence.load(Ordering::Relaxed) == PartialPersistence::Clean as u8 {
+            return Ok(());
+        }
         self.data.sync_all()?;
         self.outboard.sync_all()?;
         self.sizes.sync_all()?;
@@ -154,7 +167,19 @@ impl PartialFileStorage {
             self.bitfield,
             bitfield_path.display()
         );
+        // A failed checkpoint write may leave valid-looking bytes needing invalidation.
+        self.persistence.store(
+            PartialPersistence::InvalidationNeeded as u8,
+            Ordering::Relaxed,
+        );
+        #[cfg(test)]
+        super::persistence_tests::record_file_event(
+            bitfield_path,
+            super::persistence_tests::FileEvent::SidecarWrite,
+        );
         write_checksummed(bitfield_path, &self.bitfield)?;
+        self.persistence
+            .store(PartialPersistence::Clean as u8, Ordering::Relaxed);
         Ok(())
     }
 
@@ -195,6 +220,8 @@ impl PartialFileStorage {
             outboard,
             sizes,
             bitfield,
+            // A failed loader may not have completed its eager marker invalidation.
+            persistence: AtomicU8::new(PartialPersistence::InvalidationNeeded as u8),
         })
     }
 
@@ -239,6 +266,28 @@ impl PartialFileStorage {
 
     pub(super) fn current_size(&self) -> io::Result<u64> {
         read_size(&self.sizes)
+    }
+
+    pub(super) fn invalidate(&self, bitfield_path: &Path) -> io::Result<()> {
+        if self.persistence.load(Ordering::Relaxed) == PartialPersistence::Dirty as u8 {
+            return Ok(());
+        }
+        // Keep failed invalidation distinguishable from an already invalid checkpoint.
+        self.persistence.store(
+            PartialPersistence::InvalidationNeeded as u8,
+            Ordering::Relaxed,
+        );
+        match OpenOptions::new().write(true).open(bitfield_path) {
+            Ok(marker) => {
+                marker.set_len(0)?;
+                marker.sync_all()?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        self.persistence
+            .store(PartialPersistence::Dirty as u8, Ordering::Relaxed);
+        Ok(())
     }
 
     fn write_batch(&mut self, size: u64, batch: &[BaoContentItem]) -> io::Result<()> {
@@ -496,22 +545,44 @@ impl BaoFileStorage {
         Self::PartialMem(Default::default())
     }
 
-    /// Call sync_all on all the files.
-    #[allow(dead_code)]
-    fn sync_all(&self) -> io::Result<()> {
+    /// Synchronize a live snapshot without consuming or notifying its readers.
+    pub(super) fn sync_all(&self, bitfield_path: &Path) -> io::Result<()> {
         match self {
-            Self::Complete(_) => Ok(()),
-            Self::PartialMem(_) => Ok(()),
-            Self::NonExisting => Ok(()),
-            Self::Partial(file) => {
-                file.data.sync_all()?;
-                file.outboard.sync_all()?;
-                file.sizes.sync_all()?;
+            Self::Complete(complete) => {
+                if let MemOrFile::File(data) = &complete.data {
+                    data.sync_all()?;
+                    #[cfg(all(test, unix))]
+                    super::persistence_tests::record_sync_identity(
+                        bitfield_path,
+                        super::persistence_tests::FileEvent::DataSynced,
+                        &data.metadata()?,
+                    );
+                    #[cfg(test)]
+                    super::persistence_tests::record_file_event(
+                        bitfield_path,
+                        super::persistence_tests::FileEvent::DataSynced,
+                    );
+                }
+                if let MemOrFile::File(outboard) = &complete.outboard {
+                    outboard.sync_all()?;
+                    #[cfg(all(test, unix))]
+                    super::persistence_tests::record_sync_identity(
+                        bitfield_path,
+                        super::persistence_tests::FileEvent::OutboardSynced,
+                        &outboard.metadata()?,
+                    );
+                    #[cfg(test)]
+                    super::persistence_tests::record_file_event(
+                        bitfield_path,
+                        super::persistence_tests::FileEvent::OutboardSynced,
+                    );
+                }
                 Ok(())
             }
-            Self::Poisoned | Self::Initial | Self::Loading => {
-                // we are poisoned, so just ignore the sync
-                Ok(())
+            Self::Partial(file) => file.sync_all(bitfield_path),
+            Self::NonExisting => Err(io::ErrorKind::NotFound.into()),
+            Self::PartialMem(_) | Self::Poisoned | Self::Initial | Self::Loading => {
+                Err(io::Error::other("hash state is not persistable"))
             }
         }
     }
@@ -644,21 +715,29 @@ impl BaoFileHandle {
         &self,
         data: MemOrFile<Bytes, FixedSize<File>>,
         outboard: MemOrFile<Bytes, File>,
+        incoming_owned: bool,
     ) {
         self.send_if_modified(|guard| {
-            let needs_complete = match guard {
-                BaoFileStorage::NonExisting => true,
-                BaoFileStorage::Complete(_) => false,
-                BaoFileStorage::PartialMem(_) => true,
-                BaoFileStorage::Partial(_) => true,
-                _ => false,
-            };
-            if needs_complete {
-                *guard = BaoFileStorage::Complete(CompleteStorage { data, outboard });
-                true
-            } else {
-                true
+            match guard {
+                BaoFileStorage::Complete(current) => {
+                    // Match EntryState::union while refreshing descriptors replaced by rename.
+                    if incoming_owned {
+                        current.data = data;
+                    }
+                    if matches!(&current.outboard, MemOrFile::File(_))
+                        && matches!(&outboard, MemOrFile::File(_))
+                    {
+                        current.outboard = outboard;
+                    }
+                }
+                BaoFileStorage::NonExisting
+                | BaoFileStorage::PartialMem(_)
+                | BaoFileStorage::Partial(_) => {
+                    *guard = BaoFileStorage::Complete(CompleteStorage { data, outboard });
+                }
+                _ => {}
             }
+            true
         });
     }
 }
@@ -691,6 +770,7 @@ impl PartialMemStorage {
             outboard,
             sizes,
             bitfield: self.bitfield,
+            persistence: AtomicU8::new(PartialPersistence::Dirty as u8),
         })
     }
 }

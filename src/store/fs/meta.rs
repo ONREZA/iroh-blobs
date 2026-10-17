@@ -503,6 +503,8 @@ pub struct Actor {
     ds: DeleteHandle,
     options: BatchOptions,
     protected: HashSet<Hash>,
+    #[cfg(test)]
+    commit_gate: Option<super::phase_boundary_tests::CommitGate>,
 }
 
 impl Actor {
@@ -512,6 +514,8 @@ impl Actor {
         mut ds: DeleteHandle,
         options: BatchOptions,
     ) -> Result<Self, ActorError> {
+        #[cfg(test)]
+        let commit_gate = super::phase_boundary_tests::take_commit_gate(&db_path);
         debug!("creating or opening meta database at {}", db_path.display());
         let db = match redb::Database::create(db_path) {
             Ok(db) => db,
@@ -536,6 +540,8 @@ impl Actor {
             ds,
             options,
             protected: Default::default(),
+            #[cfg(test)]
+            commit_gate,
         })
     }
 
@@ -849,6 +855,18 @@ impl Actor {
                         }
                     }
                     drop(tables);
+                    #[cfg(test)]
+                    if let Some(gate) = self.commit_gate.take() {
+                        gate.entered.send(()).ok();
+                        let queued = self.cmds.recv().await.expect("test sync command queued");
+                        assert!(matches!(
+                            queued,
+                            Command::TopLevel(TopLevelCommand::SyncDb(_))
+                        ));
+                        self.cmds.push_back(queued).expect("test queue slot empty");
+                        gate.sync_db_queued.send(()).ok();
+                        gate.release.await.ok();
+                    }
                     tx.commit().map_err(|e| e!(ActorError::Commit, e))?;
                     ftx.commit();
                 }

@@ -26,6 +26,16 @@ impl<T> FixedSize<T> {
 }
 
 impl FixedSize<File> {
+    #[cfg(feature = "fs-store")]
+    pub(crate) fn sync_all(&self) -> io::Result<()> {
+        self.file.sync_all()
+    }
+
+    #[cfg(all(test, feature = "fs-store", unix))]
+    pub(crate) fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        self.file.metadata()
+    }
+
     pub fn try_clone(&self) -> io::Result<Self> {
         Ok(Self::new(self.file.try_clone()?, self.size))
     }
