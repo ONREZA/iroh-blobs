@@ -1,14 +1,16 @@
 #![cfg(feature = "fs-store")]
+#[cfg(feature = "rpc")]
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     ops::Deref,
 };
 
+#[cfg(feature = "rpc")]
+use iroh_blobs::api::Store;
 use iroh_blobs::{
     api::{
         self,
         tags::{TagInfo, Tags},
-        Store,
     },
     store::{fs::FsStore, mem::MemStore},
     BlobFormat, Hash, HashAndFormat,
@@ -146,6 +148,7 @@ async fn tags_smoke_fs() -> TestResult<()> {
     tags_smoke(store.tags()).await
 }
 
+#[cfg(feature = "rpc")]
 #[tokio::test]
 async fn tags_smoke_fs_rpc() -> TestResult<()> {
     tracing_subscriber::fmt::try_init().ok();

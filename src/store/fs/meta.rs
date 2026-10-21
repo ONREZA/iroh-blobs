@@ -30,6 +30,7 @@ use crate::{
     util::channel::oneshot,
     Hash,
 };
+pub(super) mod private;
 mod proto;
 pub use proto::*;
 pub(crate) mod tables;
@@ -503,15 +504,30 @@ pub struct Actor {
     ds: DeleteHandle,
     options: BatchOptions,
     protected: HashSet<Hash>,
+    admission: Option<private::Admission>,
+    #[cfg(test)]
+    commit_gate: Option<super::phase_boundary_tests::CommitGate>,
 }
 
 impl Actor {
     pub fn new(
         db_path: PathBuf,
         cmds: tokio::sync::mpsc::Receiver<Command>,
-        mut ds: DeleteHandle,
+        ds: DeleteHandle,
         options: BatchOptions,
     ) -> Result<Self, ActorError> {
+        Self::new_with_admission(db_path, cmds, ds, options, None)
+    }
+
+    pub(super) fn new_with_admission(
+        db_path: PathBuf,
+        cmds: tokio::sync::mpsc::Receiver<Command>,
+        mut ds: DeleteHandle,
+        options: BatchOptions,
+        admission: Option<private::Admission>,
+    ) -> Result<Self, ActorError> {
+        #[cfg(test)]
+        let commit_gate = super::phase_boundary_tests::take_commit_gate(&db_path);
         debug!("creating or opening meta database at {}", db_path.display());
         let db = match redb::Database::create(db_path) {
             Ok(db) => db,
@@ -529,6 +545,9 @@ impl Actor {
         Tables::new(&tx, &ftx)?;
         tx.commit()?;
         drop(ftx);
+        if let Some(admission) = &admission {
+            admission.bind_fresh(&db)?;
+        }
         let cmds = PeekableReceiver::new(cmds);
         Ok(Self {
             db,
@@ -536,6 +555,9 @@ impl Actor {
             ds,
             options,
             protected: Default::default(),
+            admission,
+            #[cfg(test)]
+            commit_gate,
         })
     }
 
@@ -783,7 +805,11 @@ impl Actor {
     }
 
     pub async fn run(self) {
+        let admission = self.admission.clone();
         if let Err(error) = self.run_inner().await {
+            if let Some(admission) = admission {
+                admission.stop();
+            }
             // Without this actor every store operation fails, so keep the cause.
             error!("metadata db actor stopped: {error:#}");
         }
@@ -798,8 +824,33 @@ impl Actor {
             let Some(cmd) = self.cmds.recv().await else {
                 break None;
             };
+            let cmd = if let Some(admission) = &self.admission {
+                match Command::non_top_level(cmd) {
+                    Ok(first) => {
+                        private::run_batch(
+                            admission,
+                            &mut db,
+                            first,
+                            op,
+                            &mut self.protected,
+                            &mut self.ds,
+                            (&mut self.cmds, options),
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Err(cmd) => cmd,
+                }
+            } else {
+                cmd
+            };
             match cmd {
                 Command::TopLevel(cmd) => {
+                    if self.admission.is_some() && matches!(cmd, TopLevelCommand::Snapshot(_)) {
+                        return Err(
+                            anyerr!("snapshots are outside the private native lineage").into()
+                        );
+                    }
                     let op = TxnNum::TopLevel(op);
                     if let Some(shutdown) = Self::handle_toplevel(&mut db, cmd, op).await? {
                         break Some(shutdown);
@@ -833,7 +884,7 @@ impl Actor {
                         .map_err(|e| e!(ActorError::Transaction, e))?;
                     let mut tables =
                         Tables::new(&tx, &ftx).map_err(|e| e!(ActorError::Table, e))?;
-                    let timeout = n0_future::time::sleep(self.options.max_read_duration);
+                    let timeout = n0_future::time::sleep(self.options.max_write_duration);
                     pin!(timeout);
                     let mut n = 0;
                     while let Some(cmd) = self
@@ -849,6 +900,18 @@ impl Actor {
                         }
                     }
                     drop(tables);
+                    #[cfg(test)]
+                    if let Some(gate) = self.commit_gate.take() {
+                        gate.entered.send(()).ok();
+                        let queued = self.cmds.recv().await.expect("test sync command queued");
+                        assert!(matches!(
+                            queued,
+                            Command::TopLevel(TopLevelCommand::SyncDb(_))
+                        ));
+                        self.cmds.push_back(queued).expect("test queue slot empty");
+                        gate.sync_db_queued.send(()).ok();
+                        gate.release.await.ok();
+                    }
                     tx.commit().map_err(|e| e!(ActorError::Commit, e))?;
                     ftx.commit();
                 }

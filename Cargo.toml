@@ -15,7 +15,7 @@ rust-version = "1.91"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(iroh_blobs_docsrs)'] }
 
 [dependencies]
-bao-tree = { version = "0.16", features = ["experimental-mixed", "tokio_fsm", "validate", "serde"], default-features = false }
+bao-tree = { version = "0.16", git = "https://github.com/ONREZA/bao-tree", rev = "aafb02a0239ed3a45bdde91403e170738924ad28", features = ["experimental-mixed", "tokio_fsm", "validate", "serde"], default-features = false }
 bytes = { version = "1", features = ["serde"] }
 constant_time_eq = "<0.4.3" # pin to avoid MSRV bump
 derive_more = { version = "2.0.1", features = ["from", "try_from", "into", "debug", "display", "deref", "deref_mut"] }
@@ -29,19 +29,19 @@ iroh-io = "0.6.1"
 rand = "0.10.1"
 hex = "0.4.3"
 serde = "1.0.217"
-postcard = { version = "1.1.1", features = ["experimental-derive", "use-std"] }
+postcard = { version = "1.1.1", default-features = false, features = ["experimental-derive", "use-std"] }
 data-encoding = "2.8.0"
 ref-cast = "1.0.24"
 arrayvec = "0.7.6"
 iroh = { version = "1.0.0", default-features = false }
 self_cell = "1.1.0"
-genawaiter = { version = "0.99.1", features = ["futures03"] }
+genawaiter = { version = "0.99.1", default-features = false, features = ["futures03"] }
 iroh-base = "1.0.0"
-iroh-tickets = "1.0.0"
+iroh-tickets = { version = "1.0.0", git = "https://github.com/ONREZA/iroh-tickets", rev = "0aa7ba6987c6f5ecb7221946c445d5d71354b5ab" }
 irpc = { version = "0.17.0", features = ["spans", "stream", "derive", "varint-util"], default-features = false }
 iroh-metrics = { version = "1.0.1" }
 iroh-util = "0.6.0"
-redb = { version = "4.1.0", optional = true }
+redb = { version = "=4.4.0", git = "https://github.com/ONREZA/redb", rev = "1a656a77b012701fa1679fd38fef28a419940f6d", optional = true }
 reflink-copy = { version = "0.1.24", optional = true }
 n0-error = "1.0.0"
 nested_enum_utils = "0.2.3"
@@ -56,6 +56,7 @@ chrono = {version = "0.4.39", default-features = false, features = ["js-sys", "w
 getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
+tokio = { version = "1.43.0", features = ["test-util"] }
 clap = { version = "4.5.31", features = ["derive"] }
 hex = "0.4.3"
 iroh-test = "0.31.0"

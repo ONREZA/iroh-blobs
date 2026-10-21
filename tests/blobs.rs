@@ -1,15 +1,15 @@
 #![cfg(feature = "fs-store")]
+use std::path::Path;
+#[cfg(feature = "rpc")]
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     ops::Deref,
-    path::Path,
 };
 
+#[cfg(feature = "rpc")]
+use iroh_blobs::api::Store;
 use iroh_blobs::{
-    api::{
-        blobs::{AddProgressItem, Blobs},
-        Store,
-    },
+    api::blobs::{AddProgressItem, Blobs},
     store::{fs::FsStore, mem::MemStore},
     Hash,
 };
@@ -101,6 +101,7 @@ async fn blobs_smoke_mem() -> TestResult {
     Ok(())
 }
 
+#[cfg(feature = "rpc")]
 #[tokio::test]
 async fn blobs_smoke_fs_rpc() -> TestResult {
     tracing_subscriber::fmt::try_init().ok();
