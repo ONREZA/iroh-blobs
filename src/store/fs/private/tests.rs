@@ -205,6 +205,67 @@ async fn startup_refusal_precedes_file_creation() {
     assert!(!directory.path().join("temp").exists());
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn fresh_metadata_serial_imports_seal_without_waiting_for_more_commands() -> Result<()> {
+    use std::{fs::File, os::unix::fs::PermissionsExt, sync::Mutex, time::Instant};
+
+    let directory = tempfile::tempdir().anyerr()?;
+    let paths = super::super::options::PathOptions::new(directory.path());
+    for path in [&paths.data_path, &paths.temp_path] {
+        std::fs::create_dir(path).anyerr()?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).anyerr()?;
+    }
+    let database = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(directory.path().join("blobs.db"))
+        .anyerr()?;
+    let slots = Arc::new(Mutex::new(Vec::new()));
+    let admission = NativeAdmission::new({
+        let slots = slots.clone();
+        move |claim| {
+            if let NativeClaim::BatchStorage { slots: count, .. } = claim {
+                slots.lock().unwrap().push(count);
+            }
+            Ok(())
+        }
+    });
+    let store = PrivateFsStore::open_fresh_metadata(
+        MetadataSeed {
+            database,
+            payloads: File::open(&paths.data_path).anyerr()?,
+            temporary: File::open(&paths.temp_path).anyerr()?,
+        },
+        profile(),
+        admission,
+        |_| Ok(()),
+    )
+    .await?;
+    for value in 0..3 {
+        let bytes = [value; 2048];
+        let hash = Hash::new(bytes);
+        let path = paths.data_path(&hash);
+        std::fs::write(&path, bytes).anyerr()?;
+        let started = Instant::now();
+        store
+            .import_verified(
+                ExpectedBlob { hash, size: 2048 },
+                File::open(path).anyerr()?,
+                None,
+                |_| Ok(()),
+            )
+            .await?;
+        eprintln!("serial tiny import {value}: {:?}", started.elapsed());
+    }
+    store.retire().await?;
+    // A sealed batch starts with one command; one slot cannot await a batch-fill timer.
+    assert_eq!(*slots.lock().unwrap(), [1, 1, 1]);
+    Ok(())
+}
+
 #[tokio::test]
 async fn existing_native_lineage_is_not_opened_by_private_constructor() {
     let directory = tempfile::tempdir().unwrap();

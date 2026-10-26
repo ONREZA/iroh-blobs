@@ -91,6 +91,7 @@ impl PrivateFsStore {
         let custody = fund(profile.requirements()?)?;
         let (database, paths) = seed.paths()?;
         let mut options = Options::new(&PathBuf::new());
+        options.batch.max_write_batch = 1;
         options.path = paths.clone();
         let (handle, native) = oneshot::channel();
         let receives = Arc::new(Semaphore::new(profile.receive_slots.get()));
