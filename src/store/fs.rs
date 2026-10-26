@@ -47,17 +47,28 @@
 //!
 //! # Runtime
 //!
-//! The fs store owns and manages its own tokio runtime. Dropping the store
-//! will clean up the database and shut down the runtime. However, some parts
-//! of the persistent state won't make it to disk, so operations involving large
-//! partial blobs will have a large initial delay on the next startup.
+//! The fs store owns and manages its own tokio runtime. Almost all store
+//! operations are small synchronous IO operations: file reads and writes, and
+//! redb transactions. Running them on a dedicated runtime lets the store
+//! perform them directly inside its tasks. The alternative, wrapping every
+//! tiny operation in `spawn_blocking`, would be slow and error-prone. It also
+//! means that blocking IO in the store never stalls the caller's runtime, and
+//! the store works no matter which runtime flavor the caller uses.
+//!
+//! Dropping the store shuts down the runtime and closes the database in the
+//! background, without waiting for either to finish. The database stays locked
+//! until it is closed, so loading the store again right after dropping it will
+//! usually fail. Also, some parts of the persistent state won't make it to
+//! disk, so operations involving large partial blobs will have a large initial
+//! delay on the next startup.
 //!
 //! It is also not guaranteed that all write operations will make it to disk.
 //! The on-disk store will be in a consistent state, but might miss some writes
 //! in the last seconds before shutdown.
 //!
-//! To avoid this, you can use the [`crate::api::Store::shutdown`] method to
-//! cleanly shut down the store and save ephemeral state to disk.
+//! To avoid this, await [`FsStore::shutdown`] before dropping the store. It
+//! returns once the database is closed and ephemeral state is saved to disk,
+//! so the store can be loaded again right away.
 //!
 //! Note that if you use the store inside a [`iroh::protocol::Router`] and shut
 //! down the router using [`iroh::protocol::Router::shutdown`], the store will be
@@ -308,9 +319,15 @@ impl SyncEntityApi for HashContext {
                     match self.global.db.get(self.id).await {
                         Ok(state) => match BaoFileStorage::open(state, self).await {
                             Ok(handle) => handle,
-                            Err(_) => BaoFileStorage::Poisoned,
+                            Err(cause) => {
+                                error!("failed to open {}, poisoning: {cause}", self.id);
+                                BaoFileStorage::Poisoned
+                            }
                         },
-                        Err(_) => BaoFileStorage::Poisoned,
+                        Err(cause) => {
+                            error!("failed to get {} from db, poisoning: {cause}", self.id);
+                            BaoFileStorage::Poisoned
+                        }
                     }
                 };
                 self.state.send_replace(state);
@@ -337,9 +354,14 @@ impl SyncEntityApi for HashContext {
                     return false;
                 }
             }
-            let Ok((state1, update)) = state.take().write_batch(batch, bitfield, self) else {
-                res = Err(io::Error::other("write batch failed"));
-                return false;
+            let (state1, update) = match state.take().write_batch(batch, bitfield, self) {
+                Ok(written) => written,
+                Err(cause) => {
+                    error!("failed to write batch for {}, poisoning: {cause}", self.id);
+                    res = Err(cause);
+                    // The poisoned entry must wake observers so they can end.
+                    return true;
+                }
             };
             res = Ok(update);
             *state = state1;
@@ -682,6 +704,10 @@ impl Actor {
         Some(response)
     }
 
+    /// Creates the actor and spawns the database actor.
+    ///
+    /// This must only be called in the context of the store runtime, since the
+    /// database actor is spawned on the current runtime and does blocking IO.
     async fn new(
         db_path: PathBuf,
         rt: tokio::runtime::Handle,
@@ -1730,20 +1756,25 @@ impl FsStore {
 #[cfg(test)]
 pub mod tests {
     use core::panic;
-    use std::collections::{HashMap, HashSet};
+    use std::{
+        collections::{HashMap, HashSet},
+        time::Duration,
+    };
 
     use bao_tree::{io::round_up_to_chunks_groups, ChunkRanges};
     use n0_future::{stream, Stream, StreamExt};
+    use n0_tracing_test::traced_test;
     use testresult::TestResult;
     use walkdir::WalkDir;
 
     use super::*;
     use crate::{
-        api::blobs::Bitfield,
+        api::blobs::{AddPathOptions, Bitfield, ImportMode},
         store::{
             util::{read_checksummed, tests::create_n0_bao, SliceInfoExt, Tag},
             IROH_BLOCK_SIZE,
         },
+        BlobFormat,
     };
 
     /// Interesting sizes for testing.
@@ -1783,9 +1814,8 @@ pub mod tests {
     }
 
     #[tokio::test]
-    // #[traced_test]
+    #[traced_test]
     async fn test_observe() -> TestResult<()> {
-        tracing_subscriber::fmt::try_init().ok();
         let testdir = tempfile::tempdir()?;
         let db_dir = testdir.path().join("db");
         let options = Options::new(&db_dir);
@@ -1826,8 +1856,8 @@ pub mod tests {
 
     // import data via import_bytes, check that we can observe it and that it is complete
     #[tokio::test]
+    #[traced_test]
     async fn test_import_byte_stream() -> TestResult<()> {
-        tracing_subscriber::fmt::try_init().ok();
         let testdir = tempfile::tempdir()?;
         let db_dir = testdir.path().join("db");
         let store = FsStore::load(db_dir).await?;
@@ -1849,8 +1879,8 @@ pub mod tests {
 
     // import data via import_bytes, check that we can observe it and that it is complete
     #[tokio::test]
+    #[traced_test]
     async fn test_import_bytes_simple() -> TestResult<()> {
-        tracing_subscriber::fmt::try_init().ok();
         let testdir = tempfile::tempdir()?;
         let db_dir = testdir.path().join("db");
         let store = FsStore::load(&db_dir).await?;
@@ -1876,8 +1906,8 @@ pub mod tests {
     // import data via import_bytes, check that we can observe it and that it is complete
     #[tokio::test]
     #[ignore = "flaky. I need a reliable way to keep the handle alive"]
+    #[traced_test]
     async fn test_roundtrip_bytes_small() -> TestResult<()> {
-        tracing_subscriber::fmt::try_init().ok();
         let testdir = tempfile::tempdir()?;
         let db_dir = testdir.path().join("db");
         let store = FsStore::load(db_dir).await?;
@@ -1909,8 +1939,8 @@ pub mod tests {
 
     // import data via import_bytes, check that we can observe it and that it is complete
     #[tokio::test]
+    #[traced_test]
     async fn test_import_path() -> TestResult<()> {
-        tracing_subscriber::fmt::try_init().ok();
         let testdir = tempfile::tempdir()?;
         let db_dir = testdir.path().join("db");
         let store = FsStore::load(db_dir).await?;
@@ -1934,8 +1964,8 @@ pub mod tests {
 
     // import data via import_bytes, check that we can observe it and that it is complete
     #[tokio::test]
+    #[traced_test]
     async fn test_export_path() -> TestResult<()> {
-        tracing_subscriber::fmt::try_init().ok();
         let testdir = tempfile::tempdir()?;
         let db_dir = testdir.path().join("db");
         let store = FsStore::load(db_dir).await?;
@@ -1953,8 +1983,8 @@ pub mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_import_bao_ranges() -> TestResult<()> {
-        tracing_subscriber::fmt::try_init().ok();
         let testdir = tempfile::tempdir()?;
         let db_dir = testdir.path().join("db");
         {
@@ -1975,8 +2005,8 @@ pub mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_import_bao_minimal() -> TestResult<()> {
-        tracing_subscriber::fmt::try_init().ok();
         let testdir = tempfile::tempdir()?;
         let sizes = [1];
         let db_dir = testdir.path().join("db");
@@ -1996,8 +2026,8 @@ pub mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_import_bao_simple() -> TestResult<()> {
-        tracing_subscriber::fmt::try_init().ok();
         let testdir = tempfile::tempdir()?;
         let sizes = [1048576];
         let db_dir = testdir.path().join("db");
@@ -2018,8 +2048,8 @@ pub mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_import_bao_persistence_full() -> TestResult<()> {
-        tracing_subscriber::fmt::try_init().ok();
         let testdir = tempfile::tempdir()?;
         let sizes = INTERESTING_SIZES;
         let db_dir = testdir.path().join("db");
@@ -2052,8 +2082,8 @@ pub mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_import_bao_persistence_just_size() -> TestResult<()> {
-        tracing_subscriber::fmt::try_init().ok();
         let testdir = tempfile::tempdir()?;
         let sizes = INTERESTING_SIZES;
         let db_dir = testdir.path().join("db");
@@ -2090,8 +2120,8 @@ pub mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_import_bao_persistence_two_stages() -> TestResult<()> {
-        tracing_subscriber::fmt::try_init().ok();
         let testdir = tempfile::tempdir()?;
         let sizes = INTERESTING_SIZES;
         let db_dir = testdir.path().join("db");
@@ -2154,8 +2184,8 @@ pub mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_import_bao_persistence_observe() -> TestResult<()> {
-        tracing_subscriber::fmt::try_init().ok();
         let testdir = tempfile::tempdir()?;
         let sizes = INTERESTING_SIZES;
         let db_dir = testdir.path().join("db");
@@ -2192,8 +2222,8 @@ pub mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_import_bao_persistence_recover() -> TestResult<()> {
-        tracing_subscriber::fmt::try_init().ok();
         let testdir = tempfile::tempdir()?;
         let sizes = INTERESTING_SIZES;
         let db_dir = testdir.path().join("db");
@@ -2231,9 +2261,123 @@ pub mod tests {
         Ok(())
     }
 
+    /// Observing an entry whose data file is missing must end the stream
+    /// instead of panicking.
     #[tokio::test]
+    #[traced_test]
+    async fn test_observe_poisoned_missing_data_file() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let db_dir = testdir.path().join("db");
+        let options = Options::new(&db_dir);
+        let data = test_data(1024 * 16 + 1);
+        let hash = Hash::new(&data);
+        {
+            let store = FsStore::load_with_opts(db_dir.join("blobs.db"), options.clone()).await?;
+            store.add_bytes(data.clone()).await?;
+            store.shutdown().await?;
+        }
+        std::fs::remove_file(options.path.data_path(&hash))?;
+        let store = FsStore::load_with_opts(db_dir.join("blobs.db"), options).await?;
+        assert!(store.observe(hash).await.is_err());
+        // the entity for the hash must still be alive, so re-adding works
+        store.add_bytes(data).await?;
+        store.shutdown().await?;
+        Ok(())
+    }
+
+    /// Importing into an entry whose data file is missing must fail.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_import_bao_poisoned_missing_data_file() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let db_dir = testdir.path().join("db");
+        let options = Options::new(&db_dir);
+        let data = test_data(1024 * 16 + 1);
+        let (hash, encoded) = create_n0_bao(&data, &ChunkRanges::all())?;
+        {
+            let store = FsStore::load_with_opts(db_dir.join("blobs.db"), options.clone()).await?;
+            store.add_bytes(data).await?;
+            store.shutdown().await?;
+        }
+        std::fs::remove_file(options.path.data_path(&hash))?;
+        let store = FsStore::load_with_opts(db_dir.join("blobs.db"), options).await?;
+        let res = store
+            .import_bao_bytes(hash, ChunkRanges::all(), encoded)
+            .await;
+        assert!(res.is_err());
+        store.shutdown().await?;
+        Ok(())
+    }
+
+    /// An observer must see the stream end when a write poisons the entry.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[traced_test]
+    async fn test_observe_ends_when_write_poisons() -> TestResult<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let testdir = tempfile::tempdir()?;
+        let db_dir = testdir.path().join("db");
+        let options = Options::new(&db_dir);
+        let store = FsStore::load_with_opts(db_dir.join("blobs.db"), options).await?;
+        // just over the inline limit, so the write has to create the data file
+        let data = test_data(1024 * 16 + 1);
+        let (hash, encoded) = create_n0_bao(&data, &ChunkRanges::all())?;
+        let mut stream = Box::pin(store.observe(hash).stream().await?);
+        assert!(stream.next().await.is_some());
+        // make it impossible to create the data file
+        let data_dir = db_dir.join("data");
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o555))?;
+        if std::fs::File::create(data_dir.join("probe")).is_ok() {
+            // running as root, permissions are not enforced
+            return Ok(());
+        }
+        let res = store
+            .import_bao_bytes(hash, ChunkRanges::all(), encoded)
+            .await;
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await;
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o755))?;
+        assert!(res.is_err());
+        assert!(matches!(next, Ok(None)));
+        Ok(())
+    }
+
+    /// Re-adding content in place from a new path must work after the old external file was deleted.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_reference_new_path_after_external_file_deleted() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let db_path = testdir.path().join("db").join("blobs.db");
+        let options = Options::new(&testdir.path().join("db"));
+        let data = test_data(1024 * 64);
+        let hash = Hash::new(&data);
+        // the old path sorts before the new one, so it is the first one in the db entry
+        let old = testdir.path().join("a.bin");
+        let new = testdir.path().join("b.bin");
+        std::fs::write(&old, &data)?;
+        std::fs::write(&new, &data)?;
+        let reference = |path: &Path| AddPathOptions {
+            path: path.to_owned(),
+            mode: ImportMode::TryReference,
+            format: BlobFormat::Raw,
+        };
+        let store = FsStore::load_with_opts(db_path.clone(), options.clone()).await?;
+        store.add_path_with_opts(reference(&old)).await?;
+        store.shutdown().await?;
+        std::fs::remove_file(&old)?;
+        let store = FsStore::load_with_opts(db_path.clone(), options.clone()).await?;
+        store.add_path_with_opts(reference(&new)).await?;
+        assert_eq!(store.get_bytes(hash).await?, data);
+        store.shutdown().await?;
+        let store = FsStore::load_with_opts(db_path, options).await?;
+        assert_eq!(store.get_bytes(hash).await?, data);
+        store.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
     async fn test_import_bytes_persistence_full() -> TestResult<()> {
-        tracing_subscriber::fmt::try_init().ok();
         let testdir = tempfile::tempdir()?;
         let sizes = INTERESTING_SIZES;
         let db_dir = testdir.path().join("db");
@@ -2298,8 +2442,8 @@ pub mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_batch_fs() -> TestResult<()> {
-        tracing_subscriber::fmt::try_init().ok();
         let testdir = tempfile::tempdir()?;
         let db_dir = testdir.path().join("db");
         let store = FsStore::load(db_dir).await?;
@@ -2307,8 +2451,8 @@ pub mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn smoke() -> TestResult<()> {
-        tracing_subscriber::fmt::try_init().ok();
         let testdir = tempfile::tempdir()?;
         let db_dir = testdir.path().join("db");
         let store = FsStore::load(db_dir).await?;
@@ -2367,6 +2511,56 @@ pub mod tests {
             //     let item = item?;
             // }
             // store.import_bao_bytes(hash, ChunkRanges::all(), bao_tree.into()).await?;
+        }
+        Ok(())
+    }
+
+    /// A failed load must return the error instead of hanging in the drop of the store runtime.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_load_root_is_file() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let root = testdir.path().join("file");
+        std::fs::write(&root, b"not a directory")?;
+        let res = tokio::time::timeout(Duration::from_secs(10), FsStore::load(&root)).await?;
+        assert!(res.is_err());
+        Ok(())
+    }
+
+    /// A failed load must return the error instead of hanging in the drop of the store runtime.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_load_already_open() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let root = testdir.path().join("db");
+        let _store = FsStore::load(&root).await?;
+        let res = tokio::time::timeout(Duration::from_secs(10), FsStore::load(&root)).await?;
+        assert!(res.is_err());
+        Ok(())
+    }
+
+    /// Dropping stores concurrently must not deadlock in the drop of the store runtime.
+    #[tokio::test(flavor = "multi_thread")]
+    #[traced_test]
+    async fn test_load_drop_concurrent() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let mut tasks = JoinSet::new();
+        for i in 0..4 {
+            let root = testdir.path().join(format!("db{i}"));
+            tasks.spawn(async move {
+                for j in 0..20 {
+                    let store = FsStore::load(root.join(format!("{j}"))).await?;
+                    store.add_bytes(vec![0u8; 100]).await?;
+                    let retired = store.wait_retired();
+                    drop(store);
+                    retired.await;
+                }
+                n0_error::Ok(())
+            });
+        }
+        let all = tasks.join_all();
+        for res in tokio::time::timeout(Duration::from_secs(30), all).await? {
+            res?;
         }
         Ok(())
     }
